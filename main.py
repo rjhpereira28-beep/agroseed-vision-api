@@ -1,12 +1,13 @@
 from fastapi import FastAPI, File, UploadFile, Form
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
+from typing import List
 import cv2
 import numpy as np
 import math
 
-app = FastAPI(title="AgroSeed - Motor de Visión Artificial")
+app = FastAPI(title="AgroSeed - Motor de Visión Artificial y Calibración")
 
-# Permite la conexión directa desde Lovable sin bloqueos de seguridad
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -15,9 +16,40 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# --- MODELOS DE DATOS PARA SIMULACIÓN DE TRASLAPE ---
+class PuntoFaja(BaseModel):
+    posicion_m: float
+    volumen_lt_ha: float
+
+class SolicitudSimulacion(BaseModel):
+    puntos: List[PuntoFaja]
+    ancho_min_m: float = 14.0
+    ancho_max_m: float = 24.0
+    paso_m: float = 1.0
+
+def clasificar_gota_asabe(dmv_um: float) -> str:
+    if dmv_um <= 0:
+        return "Sin detección"
+    elif dmv_um < 60:
+        return "Extremadamente Fina"
+    elif dmv_um < 106:
+        return "Muy Fina"
+    elif dmv_um < 235:
+        return "Fina"
+    elif dmv_um < 340:
+        return "Media"
+    elif dmv_um < 403:
+        return "Gruesa"
+    elif dmv_um < 502:
+        return "Muy Gruesa"
+    elif dmv_um < 665:
+        return "Extremadamente Gruesa"
+    else:
+        return "Ultra Gruesa"
+
 @app.get("/")
 def inicio():
-    return {"status": "ok", "mensaje": "API de AgroSeed Visión activa"}
+    return {"status": "ok", "mensaje": "API de AgroSeed Visión y Calibración activa"}
 
 @app.post("/analizar-tarjeta")
 async def api_analizar_tarjeta(
@@ -25,7 +57,7 @@ async def api_analizar_tarjeta(
     ancho_mm: float = Form(26.0),
     alto_mm: float = Form(76.0),
     factor_dispersion: float = Form(2.59),
-    margen_clips_pct: float = Form(0.15)
+    margen_clips_pct: float = Form(0.12)
 ):
     contenido = await archivo.read()
     nparr = np.frombuffer(contenido, np.uint8)
@@ -36,7 +68,7 @@ async def api_analizar_tarjeta(
 
     alto_px, ancho_px = img.shape[:2]
 
-    # Exclusión de la zona superior e inferior tapada por clips de sujeción
+    # Exclusión de la zona de clips en extremos superior e inferior
     y_inicio = int(alto_px * margen_clips_pct)
     y_fin = int(alto_px * (1.0 - margen_clips_pct))
     zona_util = img[y_inicio:y_fin, :]
@@ -44,23 +76,27 @@ async def api_analizar_tarjeta(
     alto_util_px = y_fin - y_inicio
     ancho_util_px = ancho_px
 
-    # Cálculo dimensional real del área evaluada
-    alto_util_mm = alto_real_mm = alto_mm * (1.0 - 2 * margen_clips_pct)
+    # Cálculo dimensional real
+    alto_util_mm = alto_mm * (1.0 - 2 * margen_clips_pct)
     ancho_util_mm = ancho_mm
     area_util_cm2 = (ancho_util_mm / 10.0) * (alto_util_mm / 10.0)
 
-    # Conversión física: Micrones por píxel
     micrones_px = ((ancho_util_mm * 1000.0) / ancho_util_px + (alto_util_mm * 1000.0) / alto_util_px) / 2.0
 
-    # Filtro HSV para aislar gotas azules sobre el papel amarillo
+    # Detección de manchas azules/moradas/oscuras
     hsv = cv2.cvtColor(zona_util, cv2.COLOR_BGR2HSV)
-    mascara = cv2.inRange(hsv, np.array([90, 40, 30]), np.array([160, 255, 255]))
+    mascara_color = cv2.inRange(hsv, np.array([80, 20, 20]), np.array([170, 255, 255]))
 
-    # Porcentaje de cobertura
-    pixeles_azules = cv2.countNonZero(mascara)
-    pct_cobertura = (pixeles_azules / (ancho_util_px * alto_util_px)) * 100.0
+    gris = cv2.cvtColor(zona_util, cv2.COLOR_BGR2GRAY)
+    _, mascara_oscura = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    # Conteo y medición de manchas individuales
+    mascara = cv2.bitwise_or(mascara_color, mascara_oscura)
+    kernel = np.ones((2, 2), np.uint8)
+    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel)
+
+    pixeles_gotas = cv2.countNonZero(mascara)
+    pct_cobertura = (pixeles_gotas / (ancho_util_px * alto_util_px)) * 100.0
+
     contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     diametros_reales = []
     volumenes_gotas = []
@@ -79,6 +115,7 @@ async def api_analizar_tarjeta(
     total_gotas = len(diametros_reales)
     if total_gotas == 0:
         return {
+            "total_gotas": 0,
             "cobertura_gotas_cm2": 0.0,
             "porcentaje_cobertura": 0.0,
             "dm_vmd": 0.0,
@@ -87,29 +124,141 @@ async def api_analizar_tarjeta(
             "dv09": 0.0,
             "amplitud_relativa": 0.0,
             "desvio": 0.0,
-            "volumen_teorico_lt_ha": 0.0
+            "volumen_teorico_lt_ha": 0.0,
+            "categoria_asabe": "Sin detección",
+            "pct_gotas_derivables": 0.0,
+            "pct_volumen_derivable": 0.0
         }
 
-    # Distribución volumétrica acumulada
-    indices = np.argsort(diametros_reales)
-    d_sorted = np.array(diametros_reales)[indices]
-    v_sorted = np.array(volumenes_gotas)[indices]
+    d_arr = np.array(diametros_reales)
+    v_arr = np.array(volumenes_gotas)
 
-    vol_total = np.sum(v_sorted)
+    indices = np.argsort(d_arr)
+    d_sorted = d_arr[indices]
+    v_sorted = v_arr[indices]
+
+    vol_total = float(np.sum(v_sorted))
     vol_acum = np.cumsum(v_sorted) / vol_total
 
     dv01 = float(np.interp(0.10, vol_acum, d_sorted))
     dv05 = float(np.interp(0.50, vol_acum, d_sorted))
     dv09 = float(np.interp(0.90, vol_acum, d_sorted))
 
+    # Fracción derivable (< 150 micrones)
+    mascara_deriva = d_arr < 150.0
+    pct_gotas_derivables = (float(np.sum(mascara_deriva)) / total_gotas) * 100.0
+    pct_volumen_derivable = (float(np.sum(v_arr[mascara_deriva])) / vol_total) * 100.0 if vol_total > 0 else 0.0
+
     return {
+        "total_gotas": total_gotas,
         "cobertura_gotas_cm2": round(total_gotas / area_util_cm2, 1),
         "porcentaje_cobertura": round(pct_cobertura, 1),
         "dm_vmd": round(dv05, 0),
-        "dmn": round(float(np.median(diametros_reales)), 0),
+        "dmn": round(float(np.median(d_arr)), 0),
         "dv01": round(dv01, 0),
         "dv09": round(dv09, 0),
         "amplitud_relativa": round((dv09 - dv01) / dv05 if dv05 > 0 else 0.0, 2),
-        "desvio": round(float(np.std(diametros_reales)), 1),
-        "volumen_teorico_lt_ha": round((vol_total / area_util_cm2) * 100000.0, 1)
+        "desvio": round(float(np.std(d_arr)), 1),
+        "volumen_teorico_lt_ha": round((vol_total / area_util_cm2) * 100000.0, 1),
+        "categoria_asabe": clasificar_gota_asabe(dv05),
+        "pct_gotas_derivables": round(pct_gotas_derivables, 1),
+        "pct_volumen_derivable": round(pct_volumen_derivable, 1)
+    }
+
+@app.post("/simular-faja")
+async def api_simular_faja(datos: SolicitudSimulacion):
+    if len(datos.puntos) < 2:
+        return {"error": "Se requieren al menos 2 tarjetas con posición para simular el traslape."}
+
+    # Ordenar tarjetas de izquierda a derecha según su posición en metros
+    puntos_ord = sorted(datos.puntos, key=lambda p: p.posicion_m)
+    pos_x = np.array([p.posicion_m for p in puntos_ord], dtype=float)
+    vol_y = np.array([p.volumen_lt_ha for p in puntos_ord], dtype=float)
+
+    # Crear malla continua cada 0.25 m para interpolar el perfil de una pasada
+    paso_malla = 0.25
+    x_min, x_max = float(np.min(pos_x)), float(np.max(pos_x))
+    x_perfil = np.arange(x_min, x_max + paso_malla, paso_malla)
+    y_perfil = np.interp(x_perfil, pos_x, vol_y, left=0.0, right=0.0)
+
+    # Función auxiliar para evaluar una pasada desplazada e invertida (ida y vuelta)
+    def obtener_deposito(x_eval, desplazamiento, invertir=False):
+        x_rel = x_eval - desplazamiento
+        if invertir:
+            x_rel = -x_rel
+        return np.interp(x_rel, x_perfil, y_perfil, left=0.0, right=0.0)
+
+    tabla_cv = []
+    anchos_evaluar = np.arange(datos.ancho_min_m, datos.ancho_max_m + datos.paso_m, datos.paso_m)
+
+    mejor_ancho_carrusel = datos.ancho_min_m
+    menor_cv_carrusel = 999.0
+    curvas_optimas = {}
+
+    for ancho in anchos_evaluar:
+        ancho_f = float(ancho)
+        # Evaluamos la uniformidad dentro de la zona central de trabajo (-ancho/2 a +ancho/2)
+        x_eval = np.arange(-ancho_f / 2.0, (ancho_f / 2.0) + paso_malla, paso_malla)
+
+        # 1. Modo Carrusel (Racetrack): Todas las pasadas en el mismo sentido (P-1, P0, P+1)
+        p_izq_rt = obtener_deposito(x_eval, -ancho_f, invertir=False)
+        p_cen_rt = obtener_deposito(x_eval, 0.0, invertir=False)
+        p_der_rt = obtener_deposito(x_eval, ancho_f, invertir=False)
+        suma_rt = p_izq_rt + p_cen_rt + p_der_rt
+
+        media_rt = float(np.mean(suma_rt))
+        std_rt = float(np.std(suma_rt))
+        cv_rt = (std_rt / media_rt * 100.0) if media_rt > 0 else 0.0
+
+        # 2. Modo Ida y Vuelta (Back-to-Back): Pasadas adyacentes en sentido opuesto
+        p_izq_b2b = obtener_deposito(x_eval, -ancho_f, invertir=True)
+        p_cen_b2b = obtener_deposito(x_eval, 0.0, invertir=False)
+        p_der_b2b = obtener_deposito(x_eval, ancho_f, invertir=True)
+        suma_b2b = p_izq_b2b + p_cen_b2b + p_der_b2b
+
+        media_b2b = float(np.mean(suma_b2b))
+        std_b2b = float(np.std(suma_b2b))
+        cv_b2b = (std_b2b / media_b2b * 100.0) if media_b2b > 0 else 0.0
+
+        tabla_cv.append({
+            "ancho_faja_m": round(ancho_f, 1),
+            "cv_carrusel_pct": round(cv_rt, 1),
+            "cv_ida_vuelta_pct": round(cv_b2b, 1),
+            "tasa_media_solapada_lt_ha": round(media_rt, 1)
+        })
+
+        # Guardamos el perfil gráfico del ancho con menor % CV en modo carrusel
+        if cv_rt < menor_cv_carrusel:
+            menor_cv_carrusel = cv_rt
+            mejor_ancho_carrusel = ancho_f
+
+            # Generamos puntos cada 1 metro para enviar curvas limpias al gráfico del frontend
+            x_graf = np.arange(-ancho_f * 1.5, (ancho_f * 1.5) + 1.0, 1.0)
+            curvas_optimas = {
+                "ancho_optimo_m": round(ancho_f, 1),
+                "cv_optimo_carrusel_pct": round(cv_rt, 1),
+                "tasa_media_lt_ha": round(media_rt, 1),
+                "posiciones_m": [round(float(x), 1) for x in x_graf],
+                "pasada_izquierda_lt_ha": [round(float(v), 2) for v in obtener_deposito(x_graf, -ancho_f, False)],
+                "pasada_central_lt_ha": [round(float(v), 2) for v in obtener_deposito(x_graf, 0.0, False)],
+                "pasada_derecha_lt_ha": [round(float(v), 2) for v in obtener_deposito(x_graf, ancho_f, False)],
+                "total_carrusel_lt_ha": [
+                    round(float(v), 2) for v in (
+                        obtener_deposito(x_graf, -ancho_f, False) +
+                        obtener_deposito(x_graf, 0.0, False) +
+                        obtener_deposito(x_graf, ancho_f, False)
+                    )
+                ],
+                "total_ida_vuelta_lt_ha": [
+                    round(float(v), 2) for v in (
+                        obtener_deposito(x_graf, -ancho_f, True) +
+                        obtener_deposito(x_graf, 0.0, False) +
+                        obtener_deposito(x_graf, ancho_f, True)
+                    )
+                ]
+            }
+
+    return {
+        "tabla_uniformidad_cv": tabla_cv,
+        "simulacion_grafica": curvas_optimas
     }
