@@ -16,7 +16,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- MODELOS DE DATOS PARA SIMULACIÓN DE TRASLAPE ---
 class PuntoFaja(BaseModel):
     posicion_m: float
     volumen_lt_ha: float
@@ -47,6 +46,42 @@ def clasificar_gota_asabe(dmv_um: float) -> str:
     else:
         return "Ultra Gruesa"
 
+def recortar_tarjeta_amarilla(img_bgr):
+    """
+    Detecta el rectángulo de la tarjeta hidrosensible (amarillo + manchas azules)
+    y recorta el fondo oscuro/mesa exterior para evitar falsos positivos.
+    """
+    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
+    # Máscara del papel amarillo (incluyendo tonos verdosos por luz)
+    mask_amarillo = cv2.inRange(hsv, np.array([15, 50, 60]), np.array([45, 255, 255]))
+    # Incluimos las manchas azules internas para que el contorno de la tarjeta sea sólido
+    mask_azul = cv2.inRange(hsv, np.array([85, 40, 30]), np.array([165, 255, 255]))
+    mask_tarjeta = cv2.bitwise_or(mask_amarillo, mask_azul)
+
+    kernel = np.ones((9, 9), np.uint8)
+    mask_tarjeta = cv2.morphologyEx(mask_tarjeta, cv2.MORPH_CLOSE, kernel)
+
+    contornos, _ = cv2.findContours(mask_tarjeta, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contornos:
+        return img_bgr
+
+    mayor = max(contornos, key=cv2.contourArea)
+    area_img = img_bgr.shape[0] * img_bgr.shape[1]
+
+    # Si el área amarilla detectada ocupa al menos el 5% de la foto, recortamos a su caja con un margen interior del 4%
+    if cv2.contourArea(mayor) > area_img * 0.05:
+        x, y, w, h = cv2.boundingRect(mayor)
+        margen_x = int(w * 0.04)
+        margen_y = int(h * 0.04)
+        x1 = max(0, x + margen_x)
+        y1 = max(0, y + margen_y)
+        x2 = min(img_bgr.shape[1], x + w - margen_x)
+        y2 = min(img_bgr.shape[0], y + h - margen_y)
+        if x2 > x1 and y2 > y1:
+            return img_bgr[y1:y2, x1:x2]
+
+    return img_bgr
+
 @app.get("/")
 def inicio():
     return {"status": "ok", "mensaje": "API de AgroSeed Visión y Calibración activa"}
@@ -56,8 +91,8 @@ async def api_analizar_tarjeta(
     archivo: UploadFile = File(...),
     ancho_mm: float = Form(26.0),
     alto_mm: float = Form(76.0),
-    factor_dispersion: float = Form(2.59),
-    margen_clips_pct: float = Form(0.12)
+    factor_dispersion: float = Form(1.2),
+    margen_clips_pct: float = Form(0.05)
 ):
     contenido = await archivo.read()
     nparr = np.frombuffer(contenido, np.uint8)
@@ -66,33 +101,32 @@ async def api_analizar_tarjeta(
     if img is None:
         return {"error": "Formato de imagen inválido"}
 
-    alto_px, ancho_px = img.shape[:2]
+    # 1. AISLAR EXCLUSIVAMENTE LA TARJETA AMARILLA (ignorar mesa o fondo)
+    tarjeta = recortar_tarjeta_amarilla(img)
+    alto_px, ancho_px = tarjeta.shape[:2]
 
-    # Exclusión de la zona de clips en extremos superior e inferior
+    # Exclusión de borde superior/inferior donde va el clip
     y_inicio = int(alto_px * margen_clips_pct)
     y_fin = int(alto_px * (1.0 - margen_clips_pct))
-    zona_util = img[y_inicio:y_fin, :]
+    zona_util = tarjeta[y_inicio:y_fin, :]
 
     alto_util_px = y_fin - y_inicio
     ancho_util_px = ancho_px
 
-    # Cálculo dimensional real
     alto_util_mm = alto_mm * (1.0 - 2 * margen_clips_pct)
     ancho_util_mm = ancho_mm
     area_util_cm2 = (ancho_util_mm / 10.0) * (alto_util_mm / 10.0)
 
     micrones_px = ((ancho_util_mm * 1000.0) / ancho_util_px + (alto_util_mm * 1000.0) / alto_util_px) / 2.0
 
-    # Detección de manchas azules/moradas/oscuras
+    # 2. DETECCIÓN PRECISA DE MANCHAS AZULES/ÍNDIGO SOBRE FONDO AMARILLO
     hsv = cv2.cvtColor(zona_util, cv2.COLOR_BGR2HSV)
-    mascara_color = cv2.inRange(hsv, np.array([80, 20, 20]), np.array([170, 255, 255]))
+    # Rango específico de tintes azules, cianes y morados propios de tarjeta hidrosensible
+    mascara_azul = cv2.inRange(hsv, np.array([82, 45, 25]), np.array([165, 255, 255]))
 
-    gris = cv2.cvtColor(zona_util, cv2.COLOR_BGR2GRAY)
-    _, mascara_oscura = cv2.threshold(gris, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-
-    mascara = cv2.bitwise_or(mascara_color, mascara_oscura)
+    # Limpieza de ruido de 1 píxel
     kernel = np.ones((2, 2), np.uint8)
-    mascara = cv2.morphologyEx(mascara, cv2.MORPH_OPEN, kernel)
+    mascara = cv2.morphologyEx(mascara_azul, cv2.MORPH_OPEN, kernel)
 
     pixeles_gotas = cv2.countNonZero(mascara)
     pct_cobertura = (pixeles_gotas / (ancho_util_px * alto_util_px)) * 100.0
@@ -107,6 +141,9 @@ async def api_analizar_tarjeta(
             continue
         d_mancha_um = 2.0 * math.sqrt(area_px / math.pi) * micrones_px
         d_gota_um = d_mancha_um / factor_dispersion
+        # Filtrar anomalías físicas mayores a 1,800 micrones
+        if d_gota_um > 1800.0:
+            continue
         diametros_reales.append(d_gota_um)
 
         d_cm = d_gota_um / 10000.0
@@ -144,7 +181,6 @@ async def api_analizar_tarjeta(
     dv05 = float(np.interp(0.50, vol_acum, d_sorted))
     dv09 = float(np.interp(0.90, vol_acum, d_sorted))
 
-    # Fracción derivable (< 150 micrones)
     mascara_deriva = d_arr < 150.0
     pct_gotas_derivables = (float(np.sum(mascara_deriva)) / total_gotas) * 100.0
     pct_volumen_derivable = (float(np.sum(v_arr[mascara_deriva])) / vol_total) * 100.0 if vol_total > 0 else 0.0
@@ -170,18 +206,15 @@ async def api_simular_faja(datos: SolicitudSimulacion):
     if len(datos.puntos) < 2:
         return {"error": "Se requieren al menos 2 tarjetas con posición para simular el traslape."}
 
-    # Ordenar tarjetas de izquierda a derecha según su posición en metros
     puntos_ord = sorted(datos.puntos, key=lambda p: p.posicion_m)
     pos_x = np.array([p.posicion_m for p in puntos_ord], dtype=float)
     vol_y = np.array([p.volumen_lt_ha for p in puntos_ord], dtype=float)
 
-    # Crear malla continua cada 0.25 m para interpolar el perfil de una pasada
     paso_malla = 0.25
     x_min, x_max = float(np.min(pos_x)), float(np.max(pos_x))
     x_perfil = np.arange(x_min, x_max + paso_malla, paso_malla)
     y_perfil = np.interp(x_perfil, pos_x, vol_y, left=0.0, right=0.0)
 
-    # Función auxiliar para evaluar una pasada desplazada e invertida (ida y vuelta)
     def obtener_deposito(x_eval, desplazamiento, invertir=False):
         x_rel = x_eval - desplazamiento
         if invertir:
@@ -191,16 +224,13 @@ async def api_simular_faja(datos: SolicitudSimulacion):
     tabla_cv = []
     anchos_evaluar = np.arange(datos.ancho_min_m, datos.ancho_max_m + datos.paso_m, datos.paso_m)
 
-    mejor_ancho_carrusel = datos.ancho_min_m
     menor_cv_carrusel = 999.0
     curvas_optimas = {}
 
     for ancho in anchos_evaluar:
         ancho_f = float(ancho)
-        # Evaluamos la uniformidad dentro de la zona central de trabajo (-ancho/2 a +ancho/2)
         x_eval = np.arange(-ancho_f / 2.0, (ancho_f / 2.0) + paso_malla, paso_malla)
 
-        # 1. Modo Carrusel (Racetrack): Todas las pasadas en el mismo sentido (P-1, P0, P+1)
         p_izq_rt = obtener_deposito(x_eval, -ancho_f, invertir=False)
         p_cen_rt = obtener_deposito(x_eval, 0.0, invertir=False)
         p_der_rt = obtener_deposito(x_eval, ancho_f, invertir=False)
@@ -210,7 +240,6 @@ async def api_simular_faja(datos: SolicitudSimulacion):
         std_rt = float(np.std(suma_rt))
         cv_rt = (std_rt / media_rt * 100.0) if media_rt > 0 else 0.0
 
-        # 2. Modo Ida y Vuelta (Back-to-Back): Pasadas adyacentes en sentido opuesto
         p_izq_b2b = obtener_deposito(x_eval, -ancho_f, invertir=True)
         p_cen_b2b = obtener_deposito(x_eval, 0.0, invertir=False)
         p_der_b2b = obtener_deposito(x_eval, ancho_f, invertir=True)
@@ -227,12 +256,8 @@ async def api_simular_faja(datos: SolicitudSimulacion):
             "tasa_media_solapada_lt_ha": round(media_rt, 1)
         })
 
-        # Guardamos el perfil gráfico del ancho con menor % CV en modo carrusel
         if cv_rt < menor_cv_carrusel:
             menor_cv_carrusel = cv_rt
-            mejor_ancho_carrusel = ancho_f
-
-            # Generamos puntos cada 1 metro para enviar curvas limpias al gráfico del frontend
             x_graf = np.arange(-ancho_f * 1.5, (ancho_f * 1.5) + 1.0, 1.0)
             curvas_optimas = {
                 "ancho_optimo_m": round(ancho_f, 1),
