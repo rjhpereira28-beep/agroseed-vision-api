@@ -47,15 +47,9 @@ def clasificar_gota_asabe(dmv_um: float) -> str:
         return "Ultra Gruesa"
 
 def recortar_tarjeta_amarilla(img_bgr):
-    """
-    Detecta el rectángulo de la tarjeta hidrosensible (amarillo + manchas azules)
-    y recorta el fondo oscuro/mesa exterior para evitar falsos positivos.
-    """
     hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    # Máscara del papel amarillo (incluyendo tonos verdosos por luz)
-    mask_amarillo = cv2.inRange(hsv, np.array([15, 50, 60]), np.array([45, 255, 255]))
-    # Incluimos las manchas azules internas para que el contorno de la tarjeta sea sólido
-    mask_azul = cv2.inRange(hsv, np.array([85, 40, 30]), np.array([165, 255, 255]))
+    mask_amarillo = cv2.inRange(hsv, np.array([15, 55, 65]), np.array([45, 255, 255]))
+    mask_azul = cv2.inRange(hsv, np.array([85, 45, 35]), np.array([165, 255, 255]))
     mask_tarjeta = cv2.bitwise_or(mask_amarillo, mask_azul)
 
     kernel = np.ones((9, 9), np.uint8)
@@ -68,11 +62,10 @@ def recortar_tarjeta_amarilla(img_bgr):
     mayor = max(contornos, key=cv2.contourArea)
     area_img = img_bgr.shape[0] * img_bgr.shape[1]
 
-    # Si el área amarilla detectada ocupa al menos el 5% de la foto, recortamos a su caja con un margen interior del 4%
     if cv2.contourArea(mayor) > area_img * 0.05:
         x, y, w, h = cv2.boundingRect(mayor)
-        margen_x = int(w * 0.04)
-        margen_y = int(h * 0.04)
+        margen_x = int(w * 0.06)
+        margen_y = int(h * 0.08)
         x1 = max(0, x + margen_x)
         y1 = max(0, y + margen_y)
         x2 = min(img_bgr.shape[1], x + w - margen_x)
@@ -91,8 +84,8 @@ async def api_analizar_tarjeta(
     archivo: UploadFile = File(...),
     ancho_mm: float = Form(26.0),
     alto_mm: float = Form(76.0),
-    factor_dispersion: float = Form(1.2),
-    margen_clips_pct: float = Form(0.05)
+    factor_dispersion: float = Form(2.25),
+    margen_clips_pct: float = Form(0.08)
 ):
     contenido = await archivo.read()
     nparr = np.frombuffer(contenido, np.uint8)
@@ -101,11 +94,12 @@ async def api_analizar_tarjeta(
     if img is None:
         return {"error": "Formato de imagen inválido"}
 
-    # 1. AISLAR EXCLUSIVAMENTE LA TARJETA AMARILLA (ignorar mesa o fondo)
+    # Si el usuario dejó el valor 1.2 de prueba, usamos el factor físico real del papel hidrosensible (2.25)
+    factor_real = 2.25 if factor_dispersion <= 1.3 else factor_dispersion
+
     tarjeta = recortar_tarjeta_amarilla(img)
     alto_px, ancho_px = tarjeta.shape[:2]
 
-    # Exclusión de borde superior/inferior donde va el clip
     y_inicio = int(alto_px * margen_clips_pct)
     y_fin = int(alto_px * (1.0 - margen_clips_pct))
     zona_util = tarjeta[y_inicio:y_fin, :]
@@ -119,37 +113,44 @@ async def api_analizar_tarjeta(
 
     micrones_px = ((ancho_util_mm * 1000.0) / ancho_util_px + (alto_util_mm * 1000.0) / alto_util_px) / 2.0
 
-    # 2. DETECCIÓN PRECISA DE MANCHAS AZULES/ÍNDIGO SOBRE FONDO AMARILLO
     hsv = cv2.cvtColor(zona_util, cv2.COLOR_BGR2HSV)
-    # Rango específico de tintes azules, cianes y morados propios de tarjeta hidrosensible
-    mascara_azul = cv2.inRange(hsv, np.array([82, 45, 25]), np.array([165, 255, 255]))
+    # Saturación mínima 60 y brillo mínimo 40 para excluir sombras grises/negras de clips o bordes
+    mascara_azul = cv2.inRange(hsv, np.array([85, 60, 40]), np.array([165, 255, 255]))
 
-    # Limpieza de ruido de 1 píxel
     kernel = np.ones((2, 2), np.uint8)
     mascara = cv2.morphologyEx(mascara_azul, cv2.MORPH_OPEN, kernel)
-
-    pixeles_gotas = cv2.countNonZero(mascara)
-    pct_cobertura = (pixeles_gotas / (ancho_util_px * alto_util_px)) * 100.0
 
     contornos, _ = cv2.findContours(mascara, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     diametros_reales = []
     volumenes_gotas = []
+    area_manchas_px = 0.0
 
     for c in contornos:
         area_px = cv2.contourArea(c)
         if area_px < 2.0:
             continue
-        d_mancha_um = 2.0 * math.sqrt(area_px / math.pi) * micrones_px
-        d_gota_um = d_mancha_um / factor_dispersion
-        # Filtrar anomalías físicas mayores a 1,800 micrones
-        if d_gota_um > 1800.0:
-            continue
-        diametros_reales.append(d_gota_um)
 
+        # Descartar objetos excesivamente alargados (bordes o clips)
+        _, _, w_c, h_c = cv2.boundingRect(c)
+        ratio = max(w_c, h_c) / max(1, min(w_c, h_c))
+        if ratio > 4.5:
+            continue
+
+        d_mancha_um = 2.0 * math.sqrt(area_px / math.pi) * micrones_px
+        d_gota_um = d_mancha_um / factor_real
+
+        # Rango físico real de gotas en aspersión agrícola (30 a 950 micrones)
+        if d_gota_um > 950.0:
+            continue
+
+        area_manchas_px += area_px
+        diametros_reales.append(d_gota_um)
         d_cm = d_gota_um / 10000.0
         volumenes_gotas.append((math.pi / 6.0) * (d_cm ** 3))
 
+    pct_cobertura = (area_manchas_px / (ancho_util_px * alto_util_px)) * 100.0
     total_gotas = len(diametros_reales)
+
     if total_gotas == 0:
         return {
             "total_gotas": 0,
